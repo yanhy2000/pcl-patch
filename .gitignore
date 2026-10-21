@@ -1,0 +1,36 @@
+# ---- 二进制样本 ----
+*.exe
+*.dll
+*.zip
+*.rar
+*.mrpack
+*.jar
+
+# ---- PCL 运行时数据（日志、配置、缓存）----
+/PCL/
+/Log*.txt
+/Setup.ini
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 补丁产物 / 临时输出 ----
+/out/
+/build/
+/dist/
+*.bak
+*.patched
+*.mc-patched.exe
+/docs-self/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
