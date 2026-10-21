@@ -62,11 +62,31 @@ InvalidProgramException，界面上就是「安装已有整合包」一按就报
 「选择整合包压缩文件」和 filter 串。扩展 #US 堆需要整体后移 #GUID/#Blob
 及后续资源，风险过高，因此这里**复用现有字符串**：
 
-    标题   = "选择文件位置"
-    filter = "*.zip"            ← 已有 (0x193EA)
+    标题   = "选择文件位置"          ← 已有
+    filter = "整合包|*.zip;*.rar;*.mrpack"
+             由 8 个既有片段用 String.Concat 链拼出来
 
-用户仍可在对话框里把文件类型切到「所有文件」选择 rar/mrpack，
-且拖拽入口（FormMain.FileDrag）不受影响，已经能处理 rar/zip/mrpack。
+**filter 必须是 `说明|模式` 格式**
+--------------------------------
+Win32 的 `FileDialog.Filter` 不接受裸模式串。上一版直接传 `"*.zip"`，
+`MeloongCore.Wpf.Dialogs.SelectFile` 把它原样赋给 `dialog.Filter`
+（`Dialogs.cs:51-52`），结果 `Microsoft.Win32.FileDialog.set_Filter` 抛
+`ArgumentException`：「筛选器字符串应包含筛选器的说明，后跟竖线(|)和筛选模式」。
+
+二进制里已有的合法示例（`ModJava.ManuallyImportJava`）：
+`ldstr "java.exe|java.exe"` —— 说明 + 竖线 + 模式，正是这个格式。
+
+所以这里拼出 `整合包|*.zip;*.rar;*.mrpack`：说明「整合包」，三个模式用分号分隔。
+拼装全程在栈上完成，不需要任何局部变量：
+
+    ldstr "整合包"
+    ldstr "|"
+    call  String.Concat(string,string)     ; 整合包|
+    ldstr "*.zip"
+    call  String.Concat(string,string)     ; 整合包|*.zip
+    ... 依次接上 ";" "*.rar" ";" "*." "mrpack"
+
+拖拽入口（FormMain.FileDrag）本来就不受这个 filter 影响。
 """
 
 import ilasm
@@ -75,7 +95,10 @@ MSG_BLOCK = "为遵守相关法律法规，PCL 暂时不再提供 MC 下载功�
 
 # 复用的现有字符串
 STR_TITLE = "选择文件位置"
-STR_FILTER = "*.zip"
+
+# filter 由以下既有片段拼接而成，结果 = "整合包|*.zip;*.rar;*.mrpack"
+FILTER_PARTS = ["整合包", "|", "*.zip", ";", "*.rar", ";", "*.", "mrpack"]
+FILTER_EXPECT = "整合包|*.zip;*.rar;*.mrpack"
 
 TOK = {
     "Closure_ctor": 0x060012ED,
@@ -88,6 +111,7 @@ TOK = {
     "OneOf_opImplicit": 0x0A0002DE,
     "RunInThread": 0x06001147,
     "Action_ctor": 0x0A00010F,
+    "String_Concat2": 0x0A0000C0,      # static String Concat(String, String)
 }
 
 
@@ -109,10 +133,16 @@ def build_c(p, log):
         raise RuntimeError("无参入口的阻断串不匹配")
 
     tok_title = p.find_user_string(STR_TITLE)
-    tok_filter = p.find_user_string(STR_FILTER)
-    if tok_title is None or tok_filter is None:
-        raise RuntimeError("复用的字符串缺失：title=%s filter=%s"
-                           % (tok_title, tok_filter))
+    if tok_title is None:
+        raise RuntimeError("复用的标题字符串缺失")
+    filter_toks = []
+    for part in FILTER_PARTS:
+        t = p.find_user_string(part)
+        if t is None:
+            raise RuntimeError("filter 片段 %r 不在 #US 堆里" % part)
+        filter_toks.append(t)
+    if "".join(FILTER_PARTS) != FILTER_EXPECT:
+        raise RuntimeError("filter 拼接结果自检失败")
 
     asm = ilasm.Assembler()
     skip = asm.new_label("SKIP")
@@ -127,6 +157,7 @@ def build_c(p, log):
             ("String.IsNullOrEmpty", TOK["IsNullOrEmpty"], 1, "call"),
             ("Action..ctor", TOK["Action_ctor"], 2, "newobj"),
             ("ModBase.RunInThread", TOK["RunInThread"], 1, "call"),
+            ("String.Concat", TOK["String_Concat2"], 2, "call"),
             ("_Closure$__0-0::_Lambda$__0", TOK["Closure_lambda"], 0, "ldftn"),
     ):
         sig = p.token_sig(tok)
@@ -151,7 +182,14 @@ def build_c(p, log):
     asm.emit("ldstr", 0x70000000 | tok_title)   # [c, title]
     asm.emit("ldc.i4.0")                        # [c, title, False]
     asm.emit("ldnull")                          # [c, title, False, Nothing]
-    asm.emit("ldstr", 0x70000000 | tok_filter)  # [c, title, False, Nothing, "*.zip"]
+
+    # filter：把片段用 Concat 左结合拼成 "整合包|*.zip;*.rar;*.mrpack"。
+    # 结果始终留在栈顶，不需要局部变量。
+    asm.emit("ldstr", 0x70000000 | filter_toks[0])   # [.., "整合包"]
+    for t in filter_toks[1:]:
+        asm.emit("ldstr", 0x70000000 | t)            # [.., acc, part]
+        asm.emit("call", TOK["String_Concat2"])      # [.., acc+part]
+
     asm.emit("call", TOK["OneOf_opImplicit"])   # [c, ..., OneOf]
     asm.emit("newobj", TOK["OneOf_ctor"])       # [c, ..., Nullable(Of OneOf)]
     asm.emit("call", TOK["SelectFile"])         # [c, List(Of String)]
@@ -178,9 +216,10 @@ def build_c(p, log):
 
     new_il = asm.assemble()
     meta = dict(old_size=h["code_size"], new_size=len(new_il),
-                title=STR_TITLE, filter=STR_FILTER)
+                title=STR_TITLE, filter=FILTER_EXPECT)
     log.append(("C", "ModpackInstall()：恢复文件选择对话框入口",
-                "方法体 %d → %d 字节（复用已有闭包 _Closure$__0-0，"
-                "标题「%s」、filter「%s」均为二进制内既有字符串）"
-                % (h["code_size"], len(new_il), STR_TITLE, STR_FILTER)))
+                "方法体 %d → %d 字节（复用已有闭包 _Closure$__0-0；"
+                "标题「%s」、filter「%s」由 %d 个既有字符串拼成）"
+                % (h["code_size"], len(new_il), STR_TITLE, FILTER_EXPECT,
+                   len(FILTER_PARTS))))
     return new_il, max(h["max_stack"], 4), h["local_var_sig"], meta
