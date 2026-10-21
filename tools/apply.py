@@ -52,6 +52,7 @@ import ilasm
 import siteb
 import sitec
 import sitee
+import verify_il
 from patchlib import Patcher
 
 KNOWN_VERSIONS = {
@@ -62,8 +63,10 @@ KNOWN_VERSIONS = {
 # 已打过本补丁的产物指纹。用于避免对同一文件重复打补丁时给出令人困惑的
 # 「未登记的版本」提示。
 KNOWN_PATCHED = {
-    "77e11e5b65e69dcf5665cae6781ae4fb2e5db596617a9aeca21f247d422f3a36":
+    "cf43810b595f28b1892c264b65acd84c3bf22bd179e88120d1f5434e7d93bcc3":
         "2.99.0.0 (build 413)，已打过本补丁",
+    "77e11e5b65e69dcf5665cae6781ae4fb2e5db596617a9aeca21f247d422f3a36":
+        "2.99.0.0 (build 413)，已打过本补丁（旧版，整合包安装仍有问题，请用官方原版重新打）",
 }
 
 MSG_BLOCK = "为遵守相关法律法规，PCL 暂时不再提供 MC 下载功能，非常抱歉 qwq……"
@@ -214,18 +217,22 @@ def patch_site_d(p, log):
                 "Visibility.Collapsed(2) → Visible(0)，1 字节"))
     return None
 
-    new_il, clauses, max_stack, local_sig, meta = siteb.build_b(p, TOK, log)
-    body = build_body(new_il, max_stack, local_sig, True, clauses)
-    rva, off = p.alloc(len(body), align=4)
-    p.write_inject(rva, off, body)
-    p.set_method_rva(496, rva)
-    log[-1] = (log[-1][0], log[-1][1],
-               log[-1][2] + "；搬迁到 rva 0x%X（%d 字节）" % (rva, len(body)))
-    return rva, meta
+
+def _verify_generated(p, row, code, clauses, max_stack, key, label):
+    """写盘前强制校验生成的 IL。不通过就抛错，绝不产出坏文件。"""
+    errs, warns = verify_il.verify_body(p, row, code, clauses, max_stack,
+                                        label=label)
+    for w in warns:
+        print("  warn   %s" % w)
+    if errs:
+        raise RuntimeError("%s 点生成的 IL 未通过校验（%d 项）：\n    %s"
+                           % (key, len(errs), "\n    ".join(errs)))
 
 
 def patch_site_b(p, log):
     new_il, clauses, max_stack, local_sig, meta = siteb.build_b(p, TOK, log)
+    _verify_generated(p, 496, new_il, clauses, max_stack, "B",
+                      "ModpackInstall(String)")
     body = build_body(new_il, max_stack, local_sig, True, clauses)
     rva, off = p.alloc(len(body), align=4)
     p.write_inject(rva, off, body)
@@ -237,6 +244,7 @@ def patch_site_b(p, log):
 
 def patch_site_c(p, log):
     new_il, max_stack, local_sig, meta = sitec.build_c(p, log)
+    _verify_generated(p, 495, new_il, [], max_stack, "C", "ModpackInstall()")
     body = build_body(new_il, max_stack, local_sig, False, [])
     rva, off = p.alloc(len(body), align=4)
     p.write_inject(rva, off, body)
@@ -248,6 +256,8 @@ def patch_site_c(p, log):
 
 def patch_site_e(p, log):
     new_il, clauses, max_stack, local_sig, meta = sitee.build_e(p, log)
+    _verify_generated(p, 1675, new_il, clauses, max_stack, "E",
+                      "InitializeStackResourceVersions")
     body = build_body(new_il, max_stack, local_sig, True, clauses)
     rva, off = p.alloc(len(body), align=4)
     p.write_inject(rva, off, body)
@@ -304,6 +314,9 @@ def prepare(exe, force):
         print("           该版本的补丁点可能与已知版本不同。")
         print("           脚本会逐点校验原始字节，不符则中止，不会写坏文件。")
         if not force:
+            print()
+            print("           已停止。确认要尝试，请在命令行加 --force 重新运行：")
+            print("             pcl_patch.exe \"<exe 路径>\" --force")
             return None
     print("=" * 76)
 
@@ -395,11 +408,25 @@ def _candidate_dirs():
 
 
 def autodetect():
-    """在常见位置找官方 exe。"""
+    """在常见位置找官方 exe。
+
+    只返回**已登记版本**（哈希命中 KNOWN_VERSIONS）的候选：同目录下常常
+    同时躺着预览版 / 旧版 exe，盲目取第一个会把用户引到错误的目标上。
+    """
+    cands = []
     for d in _candidate_dirs():
         try:
-            cand = d / TARGET_NAME
-            if cand.is_file():
+            for cand in d.glob("*.exe"):
+                if not cand.is_file():
+                    continue
+                if not cand.name.lower().startswith("plain craft launcher"):
+                    continue
+                cands.append(cand)
+        except Exception:
+            continue
+    for cand in cands:
+        try:
+            if sha256(cand) in KNOWN_VERSIONS:
                 return cand
         except Exception:
             continue
@@ -462,6 +489,25 @@ def interactive():
         print("\n找不到文件：%s" % exe)
         _pause()
         return 2
+
+    print()
+    digest = sha256(exe)
+    if digest in KNOWN_PATCHED:
+        print("这个文件已经打过补丁了：")
+        print("  %s" % KNOWN_PATCHED[digest])
+        print("无需重复处理；如需重来，请用官方原版重新打一次。")
+        _pause()
+        return 2
+    if digest not in KNOWN_VERSIONS:
+        print("注意：这不是本工具支持过的版本。")
+        print("  SHA-256  %s" % digest)
+        print("  补丁点位置可能与预期不同；脚本会逐点校验原始字节，不符就中止，")
+        print("  不会写坏文件，但很可能直接失败。")
+        ans = _ask("仍要尝试吗？[y/N] ", "n")
+        if ans is None or ans.lower() not in ("y", "yes"):
+            print("\n已取消，没有写入任何文件。")
+            _pause()
+            return 0
 
     print()
     prepared = prepare(exe, force=True)

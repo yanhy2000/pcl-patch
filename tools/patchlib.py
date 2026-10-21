@@ -43,6 +43,7 @@ class Patcher:
 
     def _type_index(self):
         self.method_owner = {}
+        self.method_type_row = {}
         self.type_methods = {}
         self.type_fields = {}
         self.field_rows = {}
@@ -53,6 +54,7 @@ class Patcher:
             self.type_methods[full] = list(t.MethodList)
             for it in t.MethodList:
                 self.method_owner[it.row_index] = full
+                self.method_type_row[it.row_index] = i + 1
             fl = []
             for it in t.FieldList:
                 fr = self.md.Field.rows[it.row_index - 1]
@@ -309,41 +311,181 @@ class Patcher:
             base = base()
         return base + (row_1based - 1) * self.md.MethodDef.row_size
 
+    # ------------------------------------------------------------------
+    # 签名 / token 解析（供 IL 校验器推断调用指令的栈行为）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _comp(b, i):
+        """读一个 ECMA-335 压缩整数，返回 (值, 字节数)。"""
+        c = b[i]
+        if c & 0x80 == 0:
+            return c, 1
+        if c & 0xC0 == 0x80:
+            return ((c & 0x3F) << 8) | b[i + 1], 2
+        return (((c & 0x1F) << 24) | (b[i + 1] << 16)
+                | (b[i + 2] << 8) | b[i + 3]), 4
+
+    def _sig_of_token(self, tok):
+        """取 token 指向的方法签名 blob（MethodSpec 会跟到底层方法）。"""
+        tab = tok >> 24
+        row = tok & 0xFFFFFF
+        if tab == 0x06:
+            m = self.md.MethodDef.rows[row - 1]
+        elif tab == 0x0A:
+            m = self.md.MemberRef.rows[row - 1]
+        elif tab == 0x2B:
+            spec = self.md.MethodSpec.rows[row - 1]
+            mt = spec.Method
+            if "MethodDef" in str(getattr(mt, "table", "")):
+                m = self.md.MethodDef.rows[mt.row_index - 1]
+            else:
+                m = self.md.MemberRef.rows[mt.row_index - 1]
+        else:
+            return None
+        blob = m.Signature
+        if isinstance(blob, (bytes, bytearray)):
+            return bytes(blob)
+        v = getattr(blob, "value", None)
+        return bytes(v) if isinstance(v, (bytes, bytearray)) else None
+
+    def token_sig(self, tok):
+        """返回 dict(has_this, nparams, ret_void)；无法解析时返回 None。
+
+        只需要签名头部的三个事实，不必完整解码参数类型：
+          * 是否实例方法 → call 是否额外弹 this
+          * 形参个数    → 调用弹几个
+          * 返回是否 void → 调用是否压栈
+        """
+        b = self._sig_of_token(tok)
+        if not b:
+            return None
+        try:
+            flag = b[0]
+            i = 1
+            has_this = bool(flag & 0x20)
+            if flag & 0x10:                      # GENERIC：先有 GenericParamCount
+                _, n = self._comp(b, i)
+                i += n
+            nparams, n = self._comp(b, i)
+            i += n
+            ret_void = (b[i] == 0x01)
+            return dict(has_this=has_this, nparams=nparams, ret_void=ret_void)
+        except Exception:
+            return None
+
+    def method_ret_void(self, row_1based):
+        m = self.md.MethodDef.rows[row_1based - 1]
+        blob = m.Signature
+        b = bytes(blob if isinstance(blob, (bytes, bytearray))
+                  else getattr(blob, "value", b""))
+        flag = b[0]
+        i = 1
+        if flag & 0x10:
+            _, n = self._comp(b, i)
+            i += n
+        _, n = self._comp(b, i)
+        i += n
+        return b[i] == 0x01
+
+    # ------------------------------------------------------------------
+    # 委托绑定校验
+    # ------------------------------------------------------------------
+    def sig_bytes(self, tok):
+        """token 指向方法的签名 blob 原始字节（MethodSpec 会跟到底层方法）。"""
+        return self._sig_of_token(tok)
+
+    def delegate_invoke_sig(self, ctor_tok):
+        """给定委托构造器 token，返回该委托 Invoke 的签名字节。
+
+        委托类型 = 构造器所属的 TypeDef；Invoke 是它名为 "Invoke" 的方法。
+        返回 None 表示无法解析。
+        """
+        if (ctor_tok >> 24) != 0x06:
+            return None
+        trow = self.method_type_row.get(ctor_tok & 0xFFFFFF)
+        if not trow:
+            return None
+        t = self.md.TypeDef.rows[trow - 1]
+        for it in t.MethodList:
+            m = self.md.MethodDef.rows[it.row_index - 1]
+            if self.md_row_name(m) == "Invoke":
+                return self.sig_bytes(0x06000000 | it.row_index)
+        return None
+
+    def require_delegate(self, method_tok, ctor_tok, what):
+        """断言 `ldftn method_tok` + `newobj ctor_tok` 能构成合法委托。
+
+        CLR 在 newobj 委托时会校验方法签名与委托 Invoke 的兼容性，不兼容就抛
+        InvalidProgramException —— 而这类**类型错误**是纯栈分析查不出来的。
+        这里用「签名逐字节相等」做最严格的一档校验：只要两边完全一致，
+        newobj 一定合法（存在逆变放宽的情形，但编译器为本仓库用到的绑定
+        生成的签名本就是精确匹配的）。
+        """
+        a = self.sig_bytes(method_tok)
+        b = self.delegate_invoke_sig(ctor_tok)
+        if a is None or b is None:
+            raise RuntimeError("%s：无法解析委托绑定签名" % what)
+        if a != b:
+            raise RuntimeError(
+                "%s：委托绑定签名不匹配\n"
+                "    方法 0x%08X 签名 = %s\n"
+                "    委托 Invoke 签名 = %s\n"
+                "    直接 ldftn+newobj 会被 JIT 判为 InvalidProgramException"
+                % (what, method_tok, a.hex(" "), b.hex(" ")))
+        return True
+
     def read_eh(self, h):
-        """读取异常处理表，返回 [{flags,try_off,try_len,handler_off,handler_len,class_tok}]。"""
+        """读取异常处理表，返回 [{flags,try_off,try_len,handler_off,handler_len,class_tok}]。
+
+        注意两种节头格式（ECMA-335 II.25.4.5）：
+          * fat   节头 = Kind(1) + DataSize(3) + 24 字节/子句
+          * small 节头 = Kind(1) + DataSize(1) + Reserved(2) + 12 字节/子句
+        `DataSize` 在 small 格式里是**第 2 个字节**，不是 `Kind >> 2`
+        （后者是 tiny 方法头的编码，两者毫无关系）。早期实现把 small 格式
+        误读成 `b >> 2`，会把整张表读成 0 条，导致重建出来的方法体里
+        出现「有 endfinally、却没有 finally 子句」的非法 IL。
+        另外 Kind 的 bit7 表示后面还有下一节，需要继续串读。
+        """
         if not h.get("eh"):
             return []
         raw = self.raw
-        il_end = h["file_off"] + h["fat"] + h["code_size"]
-        eo = il_end
+        eo = h["file_off"] + h["fat"] + h["code_size"]
         if eo % 4:
             eo += 4 - (eo % 4)
-        b = raw[eo]
         out = []
-        if b & 0x40:
-            size = int.from_bytes(raw[eo:eo + 4], "little") >> 8
-            n = (size - 4) // 24
-            for i in range(n):
-                q = eo + 4 + i * 24
-                out.append(dict(
-                    flags=int.from_bytes(raw[q:q + 4], "little"),
-                    try_off=int.from_bytes(raw[q + 4:q + 8], "little"),
-                    try_len=int.from_bytes(raw[q + 8:q + 12], "little"),
-                    handler_off=int.from_bytes(raw[q + 12:q + 16], "little"),
-                    handler_len=int.from_bytes(raw[q + 16:q + 20], "little"),
-                    class_tok=int.from_bytes(raw[q + 20:q + 24], "little")))
-        else:
-            size = b >> 2
-            n = (size - 4) // 12
-            for i in range(n):
-                q = eo + 4 + i * 12
-                out.append(dict(
-                    flags=int.from_bytes(raw[q:q + 2], "little"),
-                    try_off=int.from_bytes(raw[q + 2:q + 4], "little"),
-                    try_len=raw[q + 4],
-                    handler_off=int.from_bytes(raw[q + 5:q + 7], "little"),
-                    handler_len=raw[q + 7],
-                    class_tok=int.from_bytes(raw[q + 8:q + 12], "little")))
+        while eo + 4 <= len(raw):
+            kind = raw[eo]
+            if not (kind & 0x01):          # 不是 EHTable
+                break
+            if kind & 0x40:                # fat
+                size = int.from_bytes(raw[eo + 1:eo + 4], "little")
+                n = (size - 4) // 24
+                for i in range(n):
+                    q = eo + 4 + i * 24
+                    out.append(dict(
+                        flags=int.from_bytes(raw[q:q + 4], "little"),
+                        try_off=int.from_bytes(raw[q + 4:q + 8], "little"),
+                        try_len=int.from_bytes(raw[q + 8:q + 12], "little"),
+                        handler_off=int.from_bytes(raw[q + 12:q + 16], "little"),
+                        handler_len=int.from_bytes(raw[q + 16:q + 20], "little"),
+                        class_tok=int.from_bytes(raw[q + 20:q + 24], "little")))
+            else:                          # small
+                size = raw[eo + 1]
+                n = (size - 4) // 12
+                for i in range(n):
+                    q = eo + 4 + i * 12
+                    out.append(dict(
+                        flags=int.from_bytes(raw[q:q + 2], "little"),
+                        try_off=int.from_bytes(raw[q + 2:q + 4], "little"),
+                        try_len=raw[q + 4],
+                        handler_off=int.from_bytes(raw[q + 5:q + 7], "little"),
+                        handler_len=raw[q + 7],
+                        class_tok=int.from_bytes(raw[q + 8:q + 12], "little")))
+            if not (kind & 0x80):          # MoreSects
+                break
+            eo += size
+            if eo % 4:
+                eo += 4 - (eo % 4)
         return out
 
     def set_method_rva(self, row_1based, rva):

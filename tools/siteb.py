@@ -14,29 +14,29 @@
 
 原始方法的尾部布局（code-relative，IL 起点 = 0）
 ------------------------------------------------
-      0..644   try2 主体（OpenZip、整合包类型判定）
+      0..644   try 主体（OpenZip、整合包类型判定）
     644..730   catch handler（Catch ex → 翻译成友好错误后 throw）
-    730..741   ldstr "为遵守…" ; newobj Exception ; throw   ← leave 全部指向 730
+    730..741   ldstr "为遵守…" ; newobj Exception ; throw   ← 所有 leave 都指向 730
     741..751   finally handler（Archive.Dispose）
-
-上一版补丁把 730..741 NOP 掉，于是 `leave` 落点变成 730 → 顺延滑进
-741 的 finally handler 中间 → JIT 抛 InvalidProgramException → 被
-FileDrag 的兜底 Catch 吞掉 → 界面显示「PCL 无法确定适合的操作」。
+    code_size = 751（没有 ret：受限版所有路径都会抛）
 
 正确修法
 --------
-把 730..741 换成完整分派，并重排整个方法体到注入区：
+**分派必须放在原来 throw 块的位置**，因为 730 才是所有正常路径的汇合点。
+上一版把分派插在段 1 之后、又把 `leave 730` 改指到最终出口，结果分派
+没有任何前驱，成了死代码，整合包仍然装不上。
 
-      0..644        原样（分支目标不变）
-    644..644+D      新增：switch 分派
-    ...            原 catch handler（后移 D）
-    ...            原 finally handler（后移 D-11）
-    ...            ldloc.0 ; ret   ← 新出口
+新布局：
 
-所有原 `leave 730` 改为跳「新出口」，执行时先跑 finally 再返回。
+      0..644        段 1 原样
+    644..730        catch handler 原样
+    730..730+D      分派（替换掉 11 字节的 throw 块）← 所有 leave 落到这里
+    730+D..         finally handler
+    ...             ldloc.0 ; ret   ← 分派各分支 leave 到这里
+
+注意段 1 里的短分支可能因位移变大升级成长形态，所以段 1 之后是**非均匀**
+平移，所有异常表边界都必须用「旧偏移 → 新偏移」精确表重映射，不能加统一 delta。
 """
-
-import struct
 
 import ilasm
 
@@ -98,13 +98,15 @@ def build_b(p, tok, log):
         raise RuntimeError("异常表结构不符预期：%d 个 clause" % len(clauses))
     inner_fin, inner_catch, outer_fin = clauses
 
-    S1_END = inner_catch["handler_off"]              # try2 结束 = catch 起点
+    S1_END = inner_catch["handler_off"]              # try 主体结束 = catch 起点
     CATCH_LEN = inner_catch["handler_len"]
     THROW_LO = S1_END + CATCH_LEN                    # 730
     THROW_HI = outer_fin["handler_off"]              # 741
     FIN_LO = outer_fin["handler_off"]
     FIN_LEN = outer_fin["handler_len"]
     FIN_HI = FIN_LO + FIN_LEN
+    if THROW_HI - THROW_LO != 11:
+        raise RuntimeError("throw 块长度不符：%d" % (THROW_HI - THROW_LO))
 
     # throw 块形态校验：ldstr <阻断串> ; newobj ; throw
     us_tok = p.find_user_string(
@@ -167,12 +169,11 @@ def build_b(p, tok, log):
                 place_if_target(cr)
                 before = len(asm.items)
                 emit_ins(ins)
-                # emit_ins 恰好追加 1 个 Instruction
                 if len(asm.items) == before + 1:
                     cr_to_item[cr] = asm.items[-1]
 
     # ---------------- 分派代码 ----------------
-    def emit_dispatch(exit_lbl):
+    def emit_dispatch(ret_lbl):
         lbl = [asm.new_label("case%d" % i) for i in range(10)]
         dflt = asm.new_label("default")
 
@@ -181,12 +182,25 @@ def build_b(p, tok, log):
         asm.emit("br", dflt)
 
         def case(i, args, call):
+            # 逐个校验被调方法的形参个数与我压入的实参个数一致。
+            # token 是硬编码的，一旦抄错（比如把 InstallPackCompress 写成
+            # 别的方法），栈就会不平衡，JIT 直接 InvalidProgramException。
+            sig = p.token_sig(call)
+            if sig is None:
+                raise RuntimeError("B 点：无法解析调用目标 0x%08X" % call)
+            want = sig["nparams"] + (1 if sig["has_this"] else 0)
+            if want != len(args):
+                raise RuntimeError(
+                    "B 点 case %d：%s 需要 %d 个实参，实际压入 %d 个"
+                    % (i, p.md_row_name(p.md.MethodDef.rows[(call & 0xFFFFFF) - 1])
+                       if (call >> 24) == 0x06 else "0x%08X" % call,
+                       want, len(args)))
             asm.place(lbl[i])
             for a in args:
                 asm.emit(a)
             asm.emit("call", call)
             asm.emit("stloc.0")
-            asm.emit("leave", exit_lbl)
+            asm.emit("leave", ret_lbl)
 
         # 0: CurseForge(File, Archive, Base, InstanceName, Logo)
         case(0, ["ldarg.0", "ldloc.1", "ldloc.2", "ldarg.1", "ldarg.2"],
@@ -206,38 +220,35 @@ def build_b(p, tok, log):
             asm.place(lbl[i])
             asm.emit("br", dflt)
         # 9: LauncherPack(File, Archive, Base)
-        case(9, ["ldarg.0", "ldloc.1", "ldloc.2"],
-             tok["InstallPackLauncherPack"])
+        case(9, ["ldarg.0", "ldloc.1", "ldloc.2"], tok["InstallPackLauncherPack"])
         # Case Else: Compress(File, Archive)
         asm.place(dflt)
+        sig = p.token_sig(tok["InstallPackCompress"])
+        if sig is None or sig["nparams"] + (1 if sig["has_this"] else 0) != 2:
+            raise RuntimeError("B 点：InstallPackCompress 的形参个数不符预期")
         asm.emit("ldarg.0")
         asm.emit("ldloc.1")
         asm.emit("call", tok["InstallPackCompress"])
         asm.emit("stloc.0")
-        asm.emit("leave", exit_lbl)
+        asm.emit("leave", ret_lbl)
 
     # ---------------- 顺序拼装 ----------------
-    bound1 = asm.new_label("BOUND1")     # 段1 结束 / 分派起点
-    bound2 = asm.new_label("BOUND2")     # 分派结束 / catch 起点
-    bound3 = asm.new_label("BOUND3")     # catch 结束 / finally 起点
-    bound4 = asm.new_label("BOUND4")     # finally 结束 / 出口起点
+    # 分派正好落在原来 throw 块的位置：所有 `leave 730` 天然汇合到这里。
+    seg1_end = asm.new_label("SEG1_END")       # 段 1 结束 / 新 catch 起点
+    disp_start = label_for(THROW_LO)           # 原 leave 730 的目标 = 分派入口
+    fin_start = asm.new_label("FIN_START")     # finally handler 起点
+    ret_lbl = asm.new_label("RET")             # 最终出口
 
     emit_range(0, S1_END)
-    asm.place(bound1)
+    asm.place(seg1_end)
+    emit_range(S1_END, THROW_LO)               # catch handler
 
-    exit_lbl = label_for(THROW_LO)       # 原 leave 730 的目标 → 新出口
-    emit_dispatch(exit_lbl)
+    asm.place(disp_start)
+    emit_dispatch(ret_lbl)
+    asm.place(fin_start)
 
-    asm.place(bound2)
-    emit_range(S1_END, THROW_LO)
-
-    asm.place(bound3)
-    emit_range(FIN_LO, FIN_HI)
-
-    asm.place(bound4)
-    if THROW_LO not in placed:
-        asm.place(exit_lbl)
-        placed.add(THROW_LO)
+    emit_range(FIN_LO, FIN_HI)                 # finally handler
+    asm.place(ret_lbl)
     asm.emit("ldloc.0")
     asm.emit("ret")
 
@@ -249,17 +260,15 @@ def build_b(p, tok, log):
             raise RuntimeError("边界标签 %s 未放置" % lb.name)
         return lb.offset
 
-    SEG1_LEN = need_off(bound1)
-    NEW_CATCH = need_off(bound2)
-    NEW_FIN = need_off(bound3)
-    NEW_EXIT = need_off(bound4)
-    D = NEW_CATCH - SEG1_LEN
+    SEG1_LEN = need_off(seg1_end)
+    NEW_CATCH = SEG1_LEN
+    NEW_FIN = need_off(fin_start)
+    NEW_EXIT = need_off(ret_lbl)
+    D = NEW_FIN - (NEW_CATCH + CATCH_LEN)
 
-    if need_off(bound2) - need_off(bound1) != D:
-        raise RuntimeError("分派长度自检失败")
-    if NEW_FIN - NEW_CATCH != CATCH_LEN:
+    if NEW_CATCH + CATCH_LEN != need_off(disp_start):
         raise RuntimeError("catch 段长度不符：%d vs %d"
-                           % (NEW_FIN - NEW_CATCH, CATCH_LEN))
+                           % (need_off(disp_start) - NEW_CATCH, CATCH_LEN))
     if NEW_EXIT - NEW_FIN != FIN_LEN:
         raise RuntimeError("finally 段长度不符：%d vs %d"
                            % (NEW_EXIT - NEW_FIN, FIN_LEN))
@@ -268,8 +277,8 @@ def build_b(p, tok, log):
                            % (len(new_il), NEW_EXIT + 2))
 
     # ---------------- 新异常表 ----------------
-    # 段 1 内可能有短分支因位移变大而升级为长形态，因此段 1 内部是
-    # **非均匀**平移。用「旧 cr → 新偏移」精确表重映射 clause 边界。
+    SHIFT1 = SEG1_LEN - S1_END                 # 段 1 的净增长
+    SHIFT2 = SHIFT1 + (D - (THROW_HI - THROW_LO))
     new_pos = {cr: item.offset for cr, item in cr_to_item.items()}
 
     def remap(cr):
@@ -277,29 +286,39 @@ def build_b(p, tok, log):
         if cr in new_pos:
             return new_pos[cr]
         if cr < S1_END:
-            # 段 1 内的非指令边界（正常不应出现）：按最近前缀线性外推
             prev = max(k for k in new_pos if k <= cr)
             return new_pos[prev] + (cr - prev)
-        if cr < THROW_HI:
-            return cr + SEG1_LEN - S1_END + D
-        if cr < FIN_HI:
-            return cr + SEG1_LEN - S1_END + D - (THROW_HI - THROW_LO)
-        return NEW_EXIT
+        if cr < THROW_LO:
+            return cr + SHIFT1
+        if cr < FIN_LO:
+            # throw 块被分派替换：块内偏移统一映射到分派起点
+            return NEW_CATCH + CATCH_LEN
+        return cr + SHIFT2
+
+    def _clause(c, try_end=None):
+        """按重映射端点重建一条 EH 子句。
+
+        try_len / handler_len 不能沿用原值：段 1 里若有短分支升级成长形态，
+        区间长度会变，必须由重映射后的端点相减得到。
+        """
+        ts = remap(c["try_off"])
+        te = remap(c["try_off"] + c["try_len"]) if try_end is None else try_end
+        hs = remap(c["handler_off"])
+        he = remap(c["handler_off"] + c["handler_len"])
+        if te <= ts or he <= hs:
+            raise RuntimeError("EH 区间退化：try=[%d,%d) handler=[%d,%d)"
+                               % (ts, te, hs, he))
+        return (c["flags"], ts, te - ts, hs, he - hs, c["class_tok"])
 
     new_clauses = [
-        # clause[0] 内层 finally：整体在段 1 内，逐点重映射
-        (inner_fin["flags"],
-         remap(inner_fin["try_off"]), inner_fin["try_len"],
-         remap(inner_fin["handler_off"]), inner_fin["handler_len"],
-         inner_fin["class_tok"]),
+        # clause[0] 内层 finally：整段都在段 1 内，起止逐点重映射
+        _clause(inner_fin),
         # clause[1] catch：try 终点 = 新 catch 起点
-        (inner_catch["flags"], inner_catch["try_off"],
-         NEW_CATCH - inner_catch["try_off"],
-         NEW_CATCH, CATCH_LEN, inner_catch["class_tok"]),
-        # clause[2] 外层 finally：try 终点 = 新出口，handler = 新 finally 起点
-        (outer_fin["flags"], outer_fin["try_off"],
-         NEW_EXIT - outer_fin["try_off"],
-         NEW_FIN, FIN_LEN, outer_fin["class_tok"]),
+        _clause(inner_catch, try_end=NEW_CATCH),
+        # clause[2] 外层 finally：try 终点 = finally handler 起点。
+        # 不能用 NEW_EXIT：出口 `ldloc.0; ret` 在 handler 之后，
+        # 若把 try 拉过去就会与 handler 区间重叠，JIT 直接判非法。
+        _clause(outer_fin, try_end=NEW_FIN),
     ]
 
     meta = dict(D=D, old_size=h["code_size"], new_size=len(new_il),

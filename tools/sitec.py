@@ -24,28 +24,37 @@
 lambda 直接调用 `ModpackInstall(String)`）——正是官方版为这个入口生成的。
 所以不需要新建闭包，直接复用。
 
-由于只有一个局部变量（闭包实例），用 `dup + 分支` 的形式避免第二个局部：
+由于只有一个局部变量（闭包实例），用 `dup` 保住实例、再把值存进闭包字段：
 
     newobj  _Closure$__0-0..ctor
-    stloc.0
-    ldstr   <标题>
-    ldc.i4.0                     ; multiselect = False
+    dup                          ; [c, c]
+    stloc.0                      ; [c]
+    ldstr   <标题>               ; [c, title]
+    ldc.i4.0                     ; multiSelect = False
     ldnull                       ; defaultDirectory = Nothing
     ldstr   <filter>
-    call    OneOf.op_Implicit    ; string -> OneOf<string, IEnumerable<...>>
-    newobj  OneOf..ctor
+    call    OneOf.op_Implicit    ; string -> OneOf<...>
+    newobj  Nullable<OneOf<..>>..ctor
     call    Dialogs.SelectFile   ; List<string>
     call    Enumerable.FirstOrDefault<string>
-    dup
-    call    String.IsNullOrEmpty
-    brtrue  END
-    stfld   _Closure$__0-0::$VB$Local_File
+    dup                          ; [c, File, File]
+    call    String.IsNullOrEmpty ; [c, File, bool]
+    brtrue  SKIP                 ; [c, File]
+    stfld   _Closure$__0-0::$VB$Local_File   ; [] 弹 File 与 c
     ldloc.0
     ldftn   _Closure$__0-0::_Lambda$__0
     newobj  Action..ctor
     call    ModBase.RunInThread
-END:
     ret
+
+SKIP:                            ; [c, File] —— 独立出口，两条路径各自把栈清干净
+    pop
+    pop
+    ret
+
+上一版把取消分支和正常分支汇合到同一个 `ret`，而两条路径栈深不同
+（2 vs 0），且 `stfld` 前少了实例，导致栈下溢 —— CLR 直接抛
+InvalidProgramException，界面上就是「安装已有整合包」一按就报错。
 
 字符串复用
 ----------
@@ -106,31 +115,65 @@ def build_c(p, log):
                            % (tok_title, tok_filter))
 
     asm = ilasm.Assembler()
+    skip = asm.new_label("SKIP")
 
-    asm.emit("newobj", TOK["Closure_ctor"])
-    asm.emit("stloc.0")
+    # token 是硬编码的，先校验每个调用点的实参个数，抄错就会栈不平衡。
+    # 注意 newobj 的 this 由指令自己创建，实参个数 = nparams（不加 has_this）。
+    for name, tok, n, kind in (
+            ("OneOf.op_Implicit", TOK["OneOf_opImplicit"], 1, "call"),
+            ("Nullable<OneOf>..ctor", TOK["OneOf_ctor"], 1, "newobj"),
+            ("Dialogs.SelectFile", TOK["SelectFile"], 4, "call"),
+            ("Enumerable.FirstOrDefault", TOK["FirstOrDefault_str"], 1, "call"),
+            ("String.IsNullOrEmpty", TOK["IsNullOrEmpty"], 1, "call"),
+            ("Action..ctor", TOK["Action_ctor"], 2, "newobj"),
+            ("ModBase.RunInThread", TOK["RunInThread"], 1, "call"),
+            ("_Closure$__0-0::_Lambda$__0", TOK["Closure_lambda"], 0, "ldftn"),
+    ):
+        sig = p.token_sig(tok)
+        if sig is None:
+            raise RuntimeError("C 点：无法解析 %s（0x%08X）" % (name, tok))
+        if kind == "newobj":
+            want = sig["nparams"]
+        elif kind == "ldftn":
+            want = 0
+        else:
+            want = sig["nparams"] + (1 if sig["has_this"] else 0)
+        if want != n:
+            raise RuntimeError("C 点：%s 需要 %d 个实参，代码里按 %d 个写"
+                               % (name, want, n))
 
-    asm.emit("ldstr", 0x70000000 | tok_title)
-    asm.emit("ldc.i4.0")
-    asm.emit("ldnull")
-    asm.emit("ldstr", 0x70000000 | tok_filter)
-    asm.emit("call", TOK["OneOf_opImplicit"])
-    asm.emit("newobj", TOK["OneOf_ctor"])
-    asm.emit("call", TOK["SelectFile"])
-    asm.emit("call", TOK["FirstOrDefault_str"])
+    # 栈约定：dup 一次保住闭包实例，后续所有路径都以它打底。
+    #        [c] 表示栈上有闭包实例。
+    asm.emit("newobj", TOK["Closure_ctor"])     # [c]
+    asm.emit("dup")                             # [c, c]
+    asm.emit("stloc.0")                         # [c]
 
-    end = asm.new_label("END")
-    asm.emit("dup")
-    asm.emit("call", TOK["IsNullOrEmpty"])
-    asm.emit("brtrue", end)
+    asm.emit("ldstr", 0x70000000 | tok_title)   # [c, title]
+    asm.emit("ldc.i4.0")                        # [c, title, False]
+    asm.emit("ldnull")                          # [c, title, False, Nothing]
+    asm.emit("ldstr", 0x70000000 | tok_filter)  # [c, title, False, Nothing, "*.zip"]
+    asm.emit("call", TOK["OneOf_opImplicit"])   # [c, ..., OneOf]
+    asm.emit("newobj", TOK["OneOf_ctor"])       # [c, ..., Nullable(Of OneOf)]
+    asm.emit("call", TOK["SelectFile"])         # [c, List(Of String)]
+    asm.emit("call", TOK["FirstOrDefault_str"])  # [c, File]
 
-    asm.emit("stfld", TOK["Closure_File_field"])
-    asm.emit("ldloc.0")
-    asm.emit("ldftn", TOK["Closure_lambda"])
-    asm.emit("newobj", TOK["Action_ctor"])
-    asm.emit("call", TOK["RunInThread"])
+    asm.emit("dup")                             # [c, File, File]
+    asm.emit("call", TOK["IsNullOrEmpty"])      # [c, File, Boolean]
+    asm.emit("brtrue", skip)                    # [c, File]
 
-    asm.place(end)
+    asm.emit("stfld", TOK["Closure_File_field"])  # []  —— 弹 File(值) 与 c(对象)
+    asm.emit("ldloc.0")                         # [c]
+    asm.emit("ldftn", TOK["Closure_lambda"])    # [c, fnptr]
+    asm.emit("newobj", TOK["Action_ctor"])      # [Action]
+    asm.emit("call", TOK["RunInThread"])        # []
+    asm.emit("ret")
+
+    # 用户取消 / 没选文件：把打底的 [c, File] 清掉再返回。
+    # 不能和上面共用一个出口——两条路径的栈深不同（2 vs 0），
+    # 汇合点栈深不一致会被 JIT 判成 InvalidProgramException。
+    asm.place(skip)                             # [c, File]
+    asm.emit("pop")
+    asm.emit("pop")
     asm.emit("ret")
 
     new_il = asm.assemble()
